@@ -309,11 +309,20 @@ def validate(val_loader, model, criterion, opt):
     print(' * Acc@1 {top1_avg:.3f}'.format(top1_avg=top1.avg.item()))
     return losses.avg, top1.avg.item()
 
+def sweep(opt):    
+    opt.learning_rate = wandb.config.lr
+    opt.lr_decay_epochs = wandb.config.lr_decay_epochs
+    opt.lr_decay_rate = wandb.config.lr_decay_rate
+    opt.weight_decay = wandb.config.weight_decay
+    opt.momentum = wandb.config.momentum
+    opt.epochs = wandb.config.epochs
+    return opt
 
 def main():
-    wandb.init(project="ce_cimt_all")
+    wandb.init(project="ce_cimt_sweep_pretrained")
     best_acc = 0
     opt = parse_option()
+    opt = sweep(opt)
     
     # build data loader
     train_loader, val_loader = set_loader(opt)
@@ -362,8 +371,8 @@ def main():
                 opt.save_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
             save_model(model, optimizer, opt, epoch, save_file)
         
-        # if early_stopper.early_stop(loss):             
-        #     break
+        if early_stopper.early_stop(loss):             
+            break
 
     # save the last model
     save_file = os.path.join(
@@ -374,4 +383,17 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    sweep_configuration = {
+        "method": "random",
+        "metric": {"goal": "minimize", "name": "val_loss"},
+        "parameters": {
+            "lr": {"max": 0.3, "min": 0.001},
+            "lr_decay_epochs": {"values": ["30,50,90", "10,20,50", "70,80,90"]},
+            "lr_decay_rate": {"max": 0.1, "min": 0.01},
+            "weight_decay": {"max": 0.1, "min": 0.0001},
+            "momentum": {"max": 0.99, "min": 0.5},
+            "epochs": {"values":[100]},
+        },
+    }
+    sweep_id = wandb.sweep(sweep=sweep_configuration, project="ce_cimt_sweep_pretrained")
+    wandb.agent(sweep_id, function=main, count=10)

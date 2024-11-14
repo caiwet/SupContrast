@@ -11,10 +11,11 @@ import torch
 import torch.backends.cudnn as cudnn
 from torchvision import transforms, datasets
 
-from util import AverageMeter
-from util import adjust_learning_rate, warmup_learning_rate, accuracy
+from util import TwoCropTransform, AverageMeter
+from util import adjust_learning_rate, warmup_learning_rate
 from util import set_optimizer, save_model
-from networks.resnet_big import SupCEResNet
+from networks.resnet_big import SupConResNet
+from losses import SupConLoss
 
 try:
     import apex
@@ -24,6 +25,10 @@ except ImportError:
 
 import wandb
 from EarlyStopper import EarlyStopper
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 
 def parse_option():
     parser = argparse.ArgumentParser('argument for training')
@@ -36,13 +41,13 @@ def parse_option():
                         help='batch_size')
     parser.add_argument('--num_workers', type=int, default=16,
                         help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=500,
+    parser.add_argument('--epochs', type=int, default=1000,
                         help='number of training epochs')
 
     # optimization
-    parser.add_argument('--learning_rate', type=float, default=0.2,
+    parser.add_argument('--learning_rate', type=float, default=0.05,
                         help='learning rate')
-    parser.add_argument('--lr_decay_epochs', type=str, default='350,400,450',
+    parser.add_argument('--lr_decay_epochs', type=str, default='700,800,900',
                         help='where to decay lr, can be a list')
     parser.add_argument('--lr_decay_rate', type=float, default=0.1,
                         help='decay rate for learning rate')
@@ -58,8 +63,15 @@ def parse_option():
     parser.add_argument('--mean', type=str, help='mean of dataset in path in form of str tuple')
     parser.add_argument('--std', type=str, help='std of dataset in path in form of str tuple')
     parser.add_argument('--data_folder', type=str, default=None, help='path to custom dataset')
-    parser.add_argument('--n_cls', type=int, default=None, help='number of classes')
-    parser.add_argument('--size', type=int, default=None, help='size of cropped images')
+    parser.add_argument('--size', type=int, default=32, help='parameter for RandomResizedCrop')
+
+    # method
+    parser.add_argument('--method', type=str, default='SupCon',
+                        choices=['SupCon', 'SimCLR'], help='choose method')
+
+    # temperature
+    parser.add_argument('--temp', type=float, default=0.07,
+                        help='temperature for loss function')
 
     # other setting
     parser.add_argument('--cosine', action='store_true',
@@ -70,10 +82,15 @@ def parse_option():
                         help='warm-up for large batch training')
     parser.add_argument('--trial', type=str, default='0',
                         help='id for recording multiple runs')
+    # gpu setting
+    parser.add_argument('--local_rank', type=int, default=-1,
+                        help='local rank for distributed training')
+    parser.add_argument('--world_size', type=int, default=-1,
+                        help='world size for distributed training')
 
     opt = parser.parse_args()
 
-    # set the path according to the environment
+    # check if dataset is path that passed required arguments
     if opt.dataset == 'path':
         assert opt.data_folder is not None \
             and opt.mean is not None \
@@ -90,9 +107,9 @@ def parse_option():
     for it in iterations:
         opt.lr_decay_epochs.append(int(it))
 
-    opt.model_name = 'SupCE_{}_{}_lr_{}_decay_{}_bsz_{}_trial_{}'.\
-        format(opt.dataset, opt.model, opt.learning_rate, opt.weight_decay,
-               opt.batch_size, opt.trial)
+    opt.model_name = '{}_{}_{}_lr_{}_decay_{}_bsz_{}_temp_{}_trial_{}'.\
+        format(opt.method, opt.dataset, opt.model, opt.learning_rate,
+               opt.weight_decay, opt.batch_size, opt.temp, opt.trial)
 
     if opt.cosine:
         opt.model_name = '{}_cosine'.format(opt.model_name)
@@ -140,54 +157,40 @@ def set_loader(opt):
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(size=opt.size, scale=(0.2, 1.)),
         transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        normalize,
-    ])
-
-    val_transform = transforms.Compose([
+        transforms.RandomApply([
+            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+        ], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
         transforms.ToTensor(),
         normalize,
     ])
 
     if opt.dataset == 'cifar10':
         train_dataset = datasets.CIFAR10(root=opt.data_folder,
-                                         transform=train_transform,
+                                         transform=TwoCropTransform(train_transform),
                                          download=True)
-        val_dataset = datasets.CIFAR10(root=opt.data_folder,
-                                       train=False,
-                                       transform=val_transform)
     elif opt.dataset == 'cifar100':
         train_dataset = datasets.CIFAR100(root=opt.data_folder,
-                                          transform=train_transform,
+                                          transform=TwoCropTransform(train_transform),
                                           download=True)
-        val_dataset = datasets.CIFAR100(root=opt.data_folder,
-                                        train=False,
-                                        transform=val_transform)
     elif opt.dataset == 'path':
-        train_dataset = datasets.ImageFolder(root=os.path.join(opt.data_folder, 'train'),
-                                            transform=train_transform)
-        val_dataset = datasets.ImageFolder(root=os.path.join(opt.data_folder, 'val'),
-                                        transform=val_transform)
+        train_dataset = datasets.ImageFolder(root=opt.data_folder,
+                                            transform=TwoCropTransform(train_transform))
     else:
         raise ValueError(opt.dataset)
 
     train_sampler = None
+    # train_sampler = DistributedSampler(train_dataset)
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=opt.batch_size, shuffle=(train_sampler is None),
         num_workers=opt.num_workers, pin_memory=True, sampler=train_sampler)
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=opt.batch_size, shuffle=False,
-        num_workers=opt.num_workers, pin_memory=True)
 
-    return train_loader, val_loader
+    return train_loader
 
 
 def set_model(opt):
-    model = SupCEResNet(name=opt.model, num_classes=opt.n_cls)
-    class_weights = 1. / torch.tensor([379, 296, 6366], dtype=torch.float)
-    class_weights = class_weights / class_weights.sum()
-
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+    model = SupConResNet(name=opt.model)
+    criterion = SupConLoss(temperature=opt.temp)
 
     # enable synchronized Batch Normalization
     if opt.syncBN:
@@ -195,7 +198,7 @@ def set_model(opt):
 
     if torch.cuda.is_available():
         if torch.cuda.device_count() > 1:
-            model = torch.nn.DataParallel(model)
+            model.encoder = torch.nn.DataParallel(model.encoder)
         model = model.cuda()
         criterion = criterion.cuda()
         cudnn.benchmark = True
@@ -210,27 +213,34 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
-    top1 = AverageMeter()
 
     end = time.time()
     for idx, (images, labels) in enumerate(train_loader):
         data_time.update(time.time() - end)
 
-        images = images.cuda(non_blocking=True)
-        labels = labels.cuda(non_blocking=True)
+        images = torch.cat([images[0], images[1]], dim=0)
+        if torch.cuda.is_available():
+            images = images.cuda(non_blocking=True)
+            labels = labels.cuda(non_blocking=True)
         bsz = labels.shape[0]
 
         # warm-up learning rate
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
 
         # compute loss
-        output = model(images)
-        loss = criterion(output, labels)
+        features = model(images)
+        f1, f2 = torch.split(features, [bsz, bsz], dim=0)
+        features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+        if opt.method == 'SupCon':
+            loss = criterion(features, labels)
+        elif opt.method == 'SimCLR':
+            loss = criterion(features)
+        else:
+            raise ValueError('contrastive method not supported: {}'.
+                             format(opt.method))
 
         # update metric
         losses.update(loss.item(), bsz)
-        acc1 = accuracy(output, labels, topk=(1,))
-        top1.update(acc1[0], bsz)
 
         # SGD
         optimizer.zero_grad()
@@ -240,86 +250,46 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-        # print info
-        # if (idx + 1) % opt.print_freq == 0:
-        #     print('Train: [{0}][{1}/{2}]\t'
-        #           'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-        #           'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-        #           'loss {loss.val:.3f} ({loss.avg:.3f})\t'
-        #           'Acc@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-        #            epoch, idx + 1, len(train_loader), batch_time=batch_time,
-        #            data_time=data_time, loss=losses, top1=top1))
-        #     sys.stdout.flush()
 
+        # print info
         if (idx + 1) % opt.print_freq == 0:
             print('Train: [{0}][{1}/{2}]\t'
-                'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                'loss {loss_val:.3f} ({loss_avg:.3f})\t'
-                'Acc@1 {top1_val:.3f} ({top1_avg:.3f})'.format(
-                epoch, idx + 1, len(train_loader), 
-                batch_time=batch_time,
-                data_time=data_time, 
-                loss_val=losses.val, 
-                loss_avg=losses.avg, 
-                top1_val=top1.val.item(), 
-                top1_avg=top1.avg.item()))
+                  'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'loss {loss.val:.3f} ({loss.avg:.3f})'.format(
+                   epoch, idx + 1, len(train_loader), batch_time=batch_time,
+                   data_time=data_time, loss=losses))
             sys.stdout.flush()
 
-    return losses.avg, top1.avg.item()
+    return losses.avg
 
-
-def validate(val_loader, model, criterion, opt):
-    """validation"""
-    model.eval()
-
-    batch_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-
-    with torch.no_grad():
-        end = time.time()
-        for idx, (images, labels) in enumerate(val_loader):
-            images = images.float().cuda()
-            labels = labels.cuda()
-            bsz = labels.shape[0]
-
-            # forward
-            output = model(images)
-            loss = criterion(output, labels)
-
-            # update metric
-            losses.update(loss.item(), bsz)
-            acc1 = accuracy(output, labels, topk=(1,))
-            top1.update(acc1[0], bsz)
-
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if idx % opt.print_freq == 0:
-                print('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss_val:.4f} ({loss_avg:.4f})\t'
-                      'Acc@1 {top1_val:.3f} ({top1_avg:.3f})'.format(
-                       idx, len(val_loader), batch_time=batch_time,
-                       loss_val=losses.val, loss_avg=losses.avg, 
-                       top1_val=top1.val.item(), top1_avg=top1.avg.item()))
-
-    print(' * Acc@1 {top1_avg:.3f}'.format(top1_avg=top1.avg.item()))
-    return losses.avg, top1.avg.item()
-
+def sweep(opt):    
+    opt.learning_rate = wandb.config.lr
+    opt.lr_decay_epochs = wandb.config.lr_decay_epochs
+    opt.lr_decay_rate = wandb.config.lr_decay_rate
+    opt.weight_decay = wandb.config.weight_decay
+    opt.momentum = wandb.config.momentum
+    opt.temp = wandb.config.temp
+    opt.epochs = wandb.config.epochs
+    return opt
 
 def main():
-    wandb.init(project="ce_cimt_all")
-    best_acc = 0
     opt = parse_option()
+    if opt.method == 'SupCon':
+        wandb.init(project="supcon_cimt_all_train_sweep")
+    elif opt.method == 'SimCLR':
+        wandb.init(project="simclr_cimt_all_train_sweep")
     
+    # dist.init_process_group(backend='nccl')
+    # torch.cuda.set_device(opt.local_rank)
+    opt = sweep(opt)
+
     # build data loader
-    train_loader, val_loader = set_loader(opt)
+    train_loader = set_loader(opt)
 
     # build model and criterion
     model, criterion = set_model(opt)
+    # model = DDP(model, device_ids=[opt.local_rank])
 
     # build optimizer
     optimizer = set_optimizer(opt, model)
@@ -327,51 +297,51 @@ def main():
     # tensorboard
     # logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
     
+    best_loss = float('inf')
     early_stopper = EarlyStopper(patience=10, min_delta=0.01)
-    
     # training routine
     for epoch in range(1, opt.epochs + 1):
         adjust_learning_rate(opt, optimizer, epoch)
 
         # train for one epoch
         time1 = time.time()
-        loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, opt)
+        loss = train(train_loader, model, criterion, optimizer, epoch, opt)
         time2 = time.time()
         print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
-        # tensorboard logger
-        # logger.log_value('train_loss', loss, epoch)
-        # logger.log_value('train_acc', train_acc, epoch)
+        # # tensorboard logger
+        # logger.log_value('loss', loss, epoch)
         # logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
+        wandb.log({"epoch": epoch, "loss": loss, "learning_rate": optimizer.param_groups[0]['lr']})
 
-        wandb.log({"epoch": epoch, "train_loss": loss, "train_acc": train_acc, "learning_rate": optimizer.param_groups[0]['lr']})
-
-        # evaluation
-        loss, val_acc = validate(val_loader, model, criterion, opt)
-        # logger.log_value('val_loss', loss, epoch)
-        # logger.log_value('val_acc', val_acc, epoch)
-        wandb.log({"val_loss": loss, "val_acc": val_acc})
-        if val_acc > best_acc:
-            best_acc = val_acc
+        if loss < best_loss:
+            best_loss = loss
             save_file = os.path.join(
-                opt.save_folder, 'best_model.pth'.format(epoch=epoch))
-            save_model(model, optimizer, opt, epoch, save_file)
-
-        if epoch % opt.save_freq == 0:
-            save_file = os.path.join(
-                opt.save_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
+                opt.save_folder, 'best_model.pth')
             save_model(model, optimizer, opt, epoch, save_file)
         
-        # if early_stopper.early_stop(loss):             
-        #     break
+        if early_stopper.early_stop(loss):             
+            break
 
     # save the last model
     save_file = os.path.join(
-        opt.save_folder, 'last.pth')
+        opt.save_folder, 'last_model.pth')
     save_model(model, optimizer, opt, opt.epochs, save_file)
-
-    print('best accuracy: {:.2f}'.format(best_acc))
 
 
 if __name__ == '__main__':
-    main()
+    sweep_configuration = {
+        "method": "random",
+        "metric": {"goal": "minimize", "name": "loss"},
+        "parameters": {
+            "lr": {"max": 0.1, "min": 0.0001},
+            "temp": {"max": 0.8, "min": 0.1},
+            "lr_decay_epochs": {"values": ["30,50,90", "10,20,50", "70,80,90"]},
+            "lr_decay_rate": {"max": 0.1, "min": 0.01},
+            "weight_decay": {"max": 0.1, "min": 0.0001},
+            "momentum": {"max": 0.99, "min": 0.8},
+            "epochs": {"values":[100]},
+        },
+    }
+    sweep_id = wandb.sweep(sweep=sweep_configuration, project="supcon_cimt_all_train_sweep")
+    wandb.agent(sweep_id, function=main, count=10)

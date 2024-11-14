@@ -6,7 +6,7 @@ import argparse
 import time
 import math
 
-import tensorboard_logger as tb_logger
+# import tensorboard_logger as tb_logger
 import torch
 import torch.backends.cudnn as cudnn
 from torchvision import transforms, datasets
@@ -23,13 +23,19 @@ try:
 except ImportError:
     pass
 
+import wandb
+from EarlyStopper import EarlyStopper
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 
 def parse_option():
     parser = argparse.ArgumentParser('argument for training')
 
     parser.add_argument('--print_freq', type=int, default=10,
                         help='print frequency')
-    parser.add_argument('--save_freq', type=int, default=50,
+    parser.add_argument('--save_freq', type=int, default=10,
                         help='save frequency')
     parser.add_argument('--batch_size', type=int, default=256,
                         help='batch_size')
@@ -76,6 +82,11 @@ def parse_option():
                         help='warm-up for large batch training')
     parser.add_argument('--trial', type=str, default='0',
                         help='id for recording multiple runs')
+    # gpu setting
+    parser.add_argument('--local_rank', type=int, default=-1,
+                        help='local rank for distributed training')
+    parser.add_argument('--world_size', type=int, default=-1,
+                        help='world size for distributed training')
 
     opt = parser.parse_args()
 
@@ -89,7 +100,7 @@ def parse_option():
     if opt.data_folder is None:
         opt.data_folder = './datasets/'
     opt.model_path = './save/SupCon/{}_models'.format(opt.dataset)
-    opt.tb_path = './save/SupCon/{}_tensorboard'.format(opt.dataset)
+    # opt.tb_path = './save/SupCon/{}_tensorboard'.format(opt.dataset)
 
     iterations = opt.lr_decay_epochs.split(',')
     opt.lr_decay_epochs = list([])
@@ -117,9 +128,9 @@ def parse_option():
         else:
             opt.warmup_to = opt.learning_rate
 
-    opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)
-    if not os.path.isdir(opt.tb_folder):
-        os.makedirs(opt.tb_folder)
+    # opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)
+    # if not os.path.isdir(opt.tb_folder):
+    #     os.makedirs(opt.tb_folder)
 
     opt.save_folder = os.path.join(opt.model_path, opt.model_name)
     if not os.path.isdir(opt.save_folder):
@@ -169,6 +180,7 @@ def set_loader(opt):
         raise ValueError(opt.dataset)
 
     train_sampler = None
+    # train_sampler = DistributedSampler(train_dataset)
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=opt.batch_size, shuffle=(train_sampler is None),
         num_workers=opt.num_workers, pin_memory=True, sampler=train_sampler)
@@ -251,22 +263,42 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
 
     return losses.avg
 
+def sweep(opt):    
+    opt.learning_rate = wandb.config.lr
+    opt.lr_decay_epochs = wandb.config.lr_decay_epochs
+    opt.lr_decay_rate = wandb.config.lr_decay_rate
+    opt.weight_decay = wandb.config.weight_decay
+    opt.momentum = wandb.config.momentum
+    opt.temp = wandb.config.temp
+    opt.epochs = wandb.config.epochs
+    return opt
 
 def main():
     opt = parse_option()
+    
+    if opt.method == 'SupCon':
+        wandb.init(project="supcon_cimt_all_train")
+    elif opt.method == 'SimCLR':
+        wandb.init(project="simclr_cimt_all_train")
+    
+    # dist.init_process_group(backend='nccl')
+    # torch.cuda.set_device(opt.local_rank)
 
     # build data loader
     train_loader = set_loader(opt)
 
     # build model and criterion
     model, criterion = set_model(opt)
+    # model = DDP(model, device_ids=[opt.local_rank])
 
     # build optimizer
     optimizer = set_optimizer(opt, model)
 
     # tensorboard
-    logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
-
+    # logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
+    
+    best_loss = float('inf')
+    early_stopper = EarlyStopper(patience=10, min_delta=0.01)
     # training routine
     for epoch in range(1, opt.epochs + 1):
         adjust_learning_rate(opt, optimizer, epoch)
@@ -277,18 +309,23 @@ def main():
         time2 = time.time()
         print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
-        # tensorboard logger
-        logger.log_value('loss', loss, epoch)
-        logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
+        # # tensorboard logger
+        # logger.log_value('loss', loss, epoch)
+        # logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
+        wandb.log({"epoch": epoch, "loss": loss, "learning_rate": optimizer.param_groups[0]['lr']})
 
-        if epoch % opt.save_freq == 0:
+        if loss < best_loss:
+            best_loss = loss
             save_file = os.path.join(
-                opt.save_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
+                opt.save_folder, 'best_model.pth')
             save_model(model, optimizer, opt, epoch, save_file)
+        
+        if early_stopper.early_stop(loss):             
+            break
 
     # save the last model
     save_file = os.path.join(
-        opt.save_folder, 'last.pth')
+        opt.save_folder, 'last_model.pth')
     save_model(model, optimizer, opt, opt.epochs, save_file)
 
 

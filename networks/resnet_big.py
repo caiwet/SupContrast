@@ -7,6 +7,7 @@ Adapted from: https://github.com/bearpaw/pytorch-classification
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 
 
 class BasicBlock(nn.Module):
@@ -134,6 +135,7 @@ def resnet34(**kwargs):
 
 def resnet50(**kwargs):
     return ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
+    # return torchvision.models.resnet50(pretrained=True)
 
 
 def resnet101(**kwargs):
