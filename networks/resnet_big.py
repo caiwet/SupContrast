@@ -134,8 +134,8 @@ def resnet34(**kwargs):
 
 
 def resnet50(**kwargs):
-    return ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
-    # return torchvision.models.resnet50(pretrained=True)
+    # return ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
+    return torchvision.models.resnet50(pretrained=True)
 
 
 def resnet101(**kwargs):
@@ -145,7 +145,8 @@ def resnet101(**kwargs):
 model_dict = {
     'resnet18': [resnet18, 512],
     'resnet34': [resnet34, 512],
-    'resnet50': [resnet50, 2048],
+    # 'resnet50': [resnet50, 2048],
+    'resnet50': [resnet50, resnet50().fc.out_features],
     'resnet101': [resnet101, 2048],
 }
 
@@ -170,6 +171,7 @@ class SupConResNet(nn.Module):
         super(SupConResNet, self).__init__()
         model_fun, dim_in = model_dict[name]
         self.encoder = model_fun()
+        # dim_in = self.encoder.fc.out_features
         if head == 'linear':
             self.head = nn.Linear(dim_in, feat_dim)
         elif head == 'mlp':
@@ -202,10 +204,15 @@ class SupCEResNet(nn.Module):
 
 class LinearClassifier(nn.Module):
     """Linear classifier"""
-    def __init__(self, name='resnet50', num_classes=10):
+    # def __init__(self, name='resnet50', num_classes=10):
+    #     super(LinearClassifier, self).__init__()
+    #     breakpoint()
+    #     _, feat_dim = model_dict[name]
+    #     self.fc = nn.Linear(feat_dim, num_classes)
+
+    def __init__(self, input_dim, num_classes):
         super(LinearClassifier, self).__init__()
-        _, feat_dim = model_dict[name]
-        self.fc = nn.Linear(feat_dim, num_classes)
+        self.fc = nn.Linear(input_dim, num_classes)
 
     def forward(self, features):
         return self.fc(features)

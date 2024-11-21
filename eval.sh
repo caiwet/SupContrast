@@ -8,16 +8,14 @@
                                            # You can change the filenames given with -o and -e to any filenames you'd like
 
 # You can change hostname to any command you would like to run
-module load miniconda3/23.1.0 gcc/6.2.0
+module load miniconda3/23.1.0 gcc/9.2.0 cuda/12.1
 source activate cdt
 cd /n/groups/patel/caiwei/2024_MRI/SupContrast
-# python main_ce.py --batch_size 32  --epochs 100 --learning_rate 0.011890426723061715  \
-#  --lr_decay_epochs "70,80,90" --lr_decay_rate 0.02221849155505514 --momentum 0.7949582545826728 \
-#  --weight_decay 0.08237533458535484 --cosine --dataset path --mean "(0.485, 0.456, 0.406)" \
-# --std "(0.229, 0.224, 0.225)" \
-#  --data_folder /n/groups/patel/caiwei/Artery/Carotids/CIMT_split --n_cls 3 --size 128
 
-python main_ce.py --batch_size 64  --epochs 100  --cosine --dataset path --mean "(0.485, 0.456, 0.406)" \
---std "(0.229, 0.224, 0.225)" \
- --data_folder /n/groups/patel/caiwei/Artery/Carotids/CIMT_sex_split --n_cls 2 --size 128
+
+python eval.py --batch_size 64 --dataset 'path' --size 128 \
+ --mean "(0.456, 0.456, 0.456)"   --std "(0.224, 0.224, 0.224)"  \
+ --data_folder /n/groups/patel/caiwei/Artery/Carotids/CIMT_split/val \
+ --n_cls 3 --ckpt /n/groups/patel/caiwei/2024_MRI/SupContrast/save/linear_best_model.pth \
+ --ckpt_cls /n/groups/patel/caiwei/2024_MRI/SupContrast/save/linear_best_model_classifier.pth
 

@@ -25,6 +25,8 @@ except ImportError:
     pass
 
 import wandb
+from EarlyStopper import EarlyStopper
+
 
 def parse_option():
     parser = argparse.ArgumentParser('argument for training')
@@ -35,7 +37,7 @@ def parse_option():
                         help='save frequency')
     parser.add_argument('--batch_size', type=int, default=256,
                         help='batch_size')
-    parser.add_argument('--num_workers', type=int, default=0,
+    parser.add_argument('--num_workers', type=int, default=16,
                         help='num of workers to use')
     parser.add_argument('--epochs', type=int, default=100,
                         help='number of training epochs')
@@ -72,7 +74,9 @@ def parse_option():
                         help='path to pre-trained model')
 
     opt = parser.parse_args()
+    return opt
 
+def process_args(opt):
     # set the path according to the environment
     if opt.data_folder is None:
         opt.data_folder = './datasets/'
@@ -109,7 +113,7 @@ def set_model(opt):
     resnet = models.resnet50(pretrained=False)
     model = SimCLR(resnet)
     # criterion = torch.nn.CrossEntropyLoss()
-    class_weights = 1. / torch.tensor([1518, 1189, 25600], dtype=torch.float)
+    class_weights = 1. / torch.tensor([1190, 1519, 5601], dtype=torch.float)
     class_weights = class_weights / class_weights.sum()
 
     criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
@@ -150,15 +154,10 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, opt):
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
-    # auc = AverageMeter()
-    # auc_cls1 = AverageMeter()
-    # auc_cls2 = AverageMeter()
-    # auc_cls3 = AverageMeter()
 
     gt_labels = np.array([])
     pred_labels = np.array([])
 
-    end = time.time()
     for idx, (images, labels) in enumerate(train_loader):
         data_time.update(time.time() - end)
 
@@ -184,13 +183,6 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, opt):
         gt_labels = np.concatenate((gt_labels, labels.cpu().numpy()))
         pred_labels = np.concatenate((pred_labels, get_pred_label(output).cpu().numpy()))
 
-        # avg_auc, auc_scores = get_auc(labels, output)
-        # auc.update(avg_auc, bsz)
-        # auc_cls1.update(auc_scores[0], bsz)
-        # auc_cls2.update(auc_scores[1], bsz)
-        # auc_cls3.update(auc_scores[2], bsz)
-        # f1_score = get_f1(labels, output)
-        # f1.update(f1_score, bsz)
         # SGD
         optimizer.zero_grad()
         loss.backward()
@@ -211,9 +203,8 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, opt):
                    data_time=data_time, loss=losses, top1_val=top1.val.item(), top1_avg=top1.avg.item()))
             sys.stdout.flush()
     f1 = f1_score(gt_labels, pred_labels, average="macro")
-    
+    # avg_auc, auc_scores = get_auc(gt_labels, pred_labels)
     return losses.avg, top1.avg.item(), f1
-
 
 def validate(val_loader, model, classifier, criterion, opt):
     """validation"""
@@ -247,14 +238,6 @@ def validate(val_loader, model, classifier, criterion, opt):
             gt_labels = np.concatenate((gt_labels, labels.cpu().numpy()))
             pred_labels = np.concatenate((pred_labels, get_pred_label(output).cpu().numpy()))
 
-            # avg_auc, auc_scores = get_auc(labels, output)
-            # auc.update(avg_auc, bsz)
-            # auc_cls1.update(auc_scores[0], bsz)
-            # auc_cls2.update(auc_scores[1], bsz)
-            # auc_cls3.update(auc_scores[2], bsz)
-
-            # f1_score = get_f1(labels, output)
-            # f1.update(f1_score, bsz)
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
@@ -269,13 +252,26 @@ def validate(val_loader, model, classifier, criterion, opt):
 
     print(' * Acc@1 {top1_avg:.3f}'.format(top1_avg=top1.avg.item()))
     f1 = f1_score(gt_labels, pred_labels, average="macro")
+    # macro_ovr_auc, weighted_ovr_auc = get_auc(gt_labels, pred_labels)
     return losses.avg, top1.avg.item(), f1
 
+def sweep(opt):    
+    opt.learning_rate = wandb.config.lr
+    opt.lr_decay_epochs = wandb.config.lr_decay_epochs
+    opt.lr_decay_rate = wandb.config.lr_decay_rate
+    opt.weight_decay = wandb.config.weight_decay
+    opt.momentum = wandb.config.momentum
+    opt.epochs = wandb.config.epochs
+    opt.batch_size = wandb.config.batch_size
+    opt.size = wandb.config.size
+    return opt
 
 def main():
-    best_acc = 0
     best_f1 = 0
     opt = parse_option()
+    wandb.init(project="simclr_linear_sweep_fixed", config=opt)
+    opt = sweep(opt)
+    opt = process_args(opt)
 
     # build data loader
     train_loader, val_loader = set_loader(opt)
@@ -286,7 +282,7 @@ def main():
     # build optimizer
     optimizer = set_optimizer(opt, classifier)
 
-    wandb.init(project="simclr_linear", config=opt)
+    early_stopper = EarlyStopper(patience=15, min_delta=0.01)
 
     # training routine
     for epoch in range(1, opt.epochs + 1):
@@ -297,29 +293,44 @@ def main():
         loss, acc, f1 = train(train_loader, model, classifier, criterion,
                           optimizer, epoch, opt)
         time2 = time.time()
-        print('Train epoch {}, total time {:.2f}, loss: {:.2f}, accuracy:{:.2f}, f1:{:.2f}'.format(
+        print('Train epoch {}, total time {:.2f}, loss: {:.2f}, accuracy:{:.2f}, f1:{:2f}'.format(
             epoch, time2 - time1, loss, acc, f1))
         wandb.log({"Epoch": epoch, "Train Loss": loss, "Train Accuracy": acc,
                    "learning_rate": optimizer.param_groups[0]['lr'],
                    "Training f1": f1})
         # eval for one epoch
-        loss, val_acc, f1 = validate(val_loader, model, classifier, criterion, opt)
-        if val_acc > best_acc:
-            best_acc = val_acc
-        if f1 > best_f1:
-            best_f1 = f1
-            torch.save(model.state_dict(), 'save/linear_best_model_fixed.pth')
-            torch.save(classifier.state_dict(), 'save/linear_best_model_classifier_fixed.pth')
-        print('Val epoch {}, loss: {:.2f}, accuracy:{:.2f}, f1:{:.2f}'.format(
+        loss, val_acc, val_f1= validate(val_loader, model, classifier, criterion, opt)
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            torch.save(model.state_dict(), 'save/linear_best_sweep_model.pth')
+        print('Val epoch {}, loss: {:.2f}, accuracy:{:.2f}, f1:{:2f}'.format(
             epoch, loss, val_acc, f1))
+
+        if early_stopper.early_stop(f1):             
+            break
         
         wandb.log({"Validation Loss": loss, "Validation Accuracy": val_acc,
-        "Validation f1": f1})
+        "Validation f1": val_f1})
 
-    print('best accuracy: {:.2f}'.format(best_acc))
     print('best f1: {:.2f}'.format(best_f1))
-    torch.save(model.state_dict(), 'save/linear_last_model_fixed.pth')
-    torch.save(classifier.state_dict(), 'save/linear_last_model_classifier_fixed.pth')
+    torch.save(model.state_dict(), 'save/linear_last_sweep_model.pth')
 
 if __name__ == '__main__':
-    main()
+    sweep_configuration = {
+        "method": "random",
+        "metric": {"goal": "maximize", "name": "Validation Loss"},
+        "parameters": {
+            "lr": {"max": 0.2, "min": 1e-5},
+            "lr_decay_epochs": {"values": ['30,50,90', '10,20,50', '10,20,30,40,50,60,70,80,90']},
+            # "lr": {"values": [0.1, 0.01, 0.001, 0.0001, 1e-5]},
+            # "lr_decay_epochs": {"values": ["10,20,30,40,50,60,70,80,90"]},
+            "lr_decay_rate": {"max": 0.5, "min": 0.1},
+            "weight_decay": {"max": 0.5, "min": 0.1},
+            "momentum": {"max": 0.99, "min": 0.8},
+            "epochs": {"values":[500]},
+            "batch_size": {"values": [64, 128, 256]},
+            "size": {"values": [128, 224]}
+        },
+    }
+    sweep_id = wandb.sweep(sweep=sweep_configuration, project="simclr_linear_sweep_fixed")
+    wandb.agent(sweep_id, function=main, count=20)

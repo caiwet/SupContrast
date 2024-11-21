@@ -90,6 +90,8 @@ def parse_option():
 
     opt = parser.parse_args()
 
+    
+
     # check if dataset is path that passed required arguments
     if opt.dataset == 'path':
         assert opt.data_folder is not None \
@@ -99,7 +101,7 @@ def parse_option():
     # set the path according to the environment
     if opt.data_folder is None:
         opt.data_folder = './datasets/'
-    opt.model_path = './save/SupCon/{}_models'.format(opt.dataset)
+    opt.model_path = './save/sex/SupCon/{}_models'.format(opt.dataset)
     # opt.tb_path = './save/SupCon/{}_tensorboard'.format(opt.dataset)
 
     iterations = opt.lr_decay_epochs.split(',')
@@ -275,10 +277,12 @@ def sweep(opt):
 
 def main():
     opt = parse_option()
+    
     if opt.method == 'SupCon':
-        wandb.init(project="supcon_cimt_all_train_sweep")
+        project_name = "supcon_cimt_sex_pretrained_sweep"
     elif opt.method == 'SimCLR':
-        wandb.init(project="simclr_cimt_all_train_sweep")
+        project_name = "simclr_cimt_sex_pretrained_sweep"
+    wandb.init(project=project_name)
     
     # dist.init_process_group(backend='nccl')
     # torch.cuda.set_device(opt.local_rank)
@@ -298,7 +302,7 @@ def main():
     # logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
     
     best_loss = float('inf')
-    early_stopper = EarlyStopper(patience=10, min_delta=0.01)
+    early_stopper = EarlyStopper(patience=15, min_delta=0.01)
     # training routine
     for epoch in range(1, opt.epochs + 1):
         adjust_learning_rate(opt, optimizer, epoch)
@@ -334,14 +338,17 @@ if __name__ == '__main__':
         "method": "random",
         "metric": {"goal": "minimize", "name": "loss"},
         "parameters": {
-            "lr": {"max": 0.1, "min": 0.0001},
-            "temp": {"max": 0.8, "min": 0.1},
-            "lr_decay_epochs": {"values": ["30,50,90", "10,20,50", "70,80,90"]},
-            "lr_decay_rate": {"max": 0.1, "min": 0.01},
-            "weight_decay": {"max": 0.1, "min": 0.0001},
+            # "lr": {"max": 0.02, "min": 0.01},
+            # "temp": {"max": 0.8, "min": 0.3},
+            # "lr_decay_epochs": {"values": ["30,50,90", "10,20,50", "70,80,90"]},
+            "lr": {"values": [0.5]},
+            "temp": {"values": [0.5]},
+            "lr_decay_epochs": {"values": ["1,2,3,4,5,10"]},
+            "lr_decay_rate": {"max": 0.3, "min": 0.1},
+            "weight_decay": {"max": 0.3, "min": 0.1},
             "momentum": {"max": 0.99, "min": 0.8},
             "epochs": {"values":[100]},
         },
     }
-    sweep_id = wandb.sweep(sweep=sweep_configuration, project="supcon_cimt_all_train_sweep")
+    sweep_id = wandb.sweep(sweep=sweep_configuration, project="simclr_cimt_sex_pretrained_sweep")
     wandb.agent(sweep_id, function=main, count=10)

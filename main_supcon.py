@@ -99,7 +99,7 @@ def parse_option():
     # set the path according to the environment
     if opt.data_folder is None:
         opt.data_folder = './datasets/'
-    opt.model_path = './save/SupCon/{}_models'.format(opt.dataset)
+    opt.model_path = './save/left_right/SupCon/{}_models'.format(opt.dataset)
     # opt.tb_path = './save/SupCon/{}_tensorboard'.format(opt.dataset)
 
     iterations = opt.lr_decay_epochs.split(',')
@@ -263,21 +263,12 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
 
     return losses.avg
 
-def sweep(opt):    
-    opt.learning_rate = wandb.config.lr
-    opt.lr_decay_epochs = wandb.config.lr_decay_epochs
-    opt.lr_decay_rate = wandb.config.lr_decay_rate
-    opt.weight_decay = wandb.config.weight_decay
-    opt.momentum = wandb.config.momentum
-    opt.temp = wandb.config.temp
-    opt.epochs = wandb.config.epochs
-    return opt
-
 def main():
     opt = parse_option()
     
     if opt.method == 'SupCon':
-        wandb.init(project="supcon_cimt_all_train")
+        # wandb.init(project="supcon_cimt_all_train")
+        wandb.init(project="supcon_cimt_150_left_right")
     elif opt.method == 'SimCLR':
         wandb.init(project="simclr_cimt_all_train")
     

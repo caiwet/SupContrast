@@ -4,6 +4,10 @@ import math
 import numpy as np
 import torch
 import torch.optim as optim
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import label_binarize
+from sklearn.metrics import f1_score
+
 
 
 class TwoCropTransform:
@@ -49,6 +53,27 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
+def get_auc(target, score, classes=[0,1,2]):
+    with torch.no_grad():
+        y_true_bin = label_binarize(target.cpu(), classes=classes)
+        macro_ovr_auc = roc_auc_score(y_true_binarized, score, multi_class="ovr", average="macro")
+        weighted_ovr_auc = roc_auc_score(y_true_binarized, y_score, multi_class="ovr", average="weighted")
+    return macro_ovr_auc, weighted_ovr_auc
+
+def get_pred_label(output):
+    maxk = max((1,))
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    pred = pred[0]
+    return pred
+
+def get_f1(target, output):
+    with torch.no_grad():
+        maxk = max((1,))
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        pred = pred[0]
+    return f1_score(target.cpu(), pred.cpu(), average='macro')
 
 def adjust_learning_rate(args, optimizer, epoch):
     lr = args.learning_rate

@@ -14,8 +14,8 @@ cd /n/groups/patel/caiwei/2024_MRI/SupContrast
 
 python main_supcon.py --batch_size 32  \
 --learning_rate 3e-4  --lr_decay_epochs 200,400,700,800,900 \
---temp 0.5   --cosine --dataset path --mean "(0.09202574,0.08408994,0.07970464)" \
---std "(0.12714559,0.12272861,0.11388139)" \
+--temp 0.5   --cosine --dataset path --mean "(0.485, 0.456, 0.406)" \
+--std "(0.229, 0.224, 0.225)" \
 --data_folder /n/groups/patel/caiwei/Artery/Carotids/CIMT_split/train --size 128 \
 --method SimCLR
 

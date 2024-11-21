@@ -28,13 +28,13 @@ from EarlyStopper import EarlyStopper
 def parse_option():
     parser = argparse.ArgumentParser('argument for training')
 
-    parser.add_argument('--print_freq', type=int, default=10,
+    parser.add_argument('--print_freq', type=int, default=1,
                         help='print frequency')
-    parser.add_argument('--save_freq', type=int, default=50,
+    parser.add_argument('--save_freq', type=int, default=1,
                         help='save frequency')
     parser.add_argument('--batch_size', type=int, default=256,
                         help='batch_size')
-    parser.add_argument('--num_workers', type=int, default=16,
+    parser.add_argument('--num_workers', type=int, default=0,
                         help='num of workers to use')
     parser.add_argument('--epochs', type=int, default=500,
                         help='number of training epochs')
@@ -83,7 +83,7 @@ def parse_option():
     if opt.data_folder is None:
         opt.data_folder = './datasets/'
     opt.model_path = './save/SupCon/{}_models'.format(opt.dataset)
-    # opt.tb_path = './save/SupCon/{}_tensorboard'.format(opt.dataset)
+    opt.tb_path = './save/SupCon/{}_tensorboard'.format(opt.dataset)
 
     iterations = opt.lr_decay_epochs.split(',')
     opt.lr_decay_epochs = list([])
@@ -111,9 +111,9 @@ def parse_option():
         else:
             opt.warmup_to = opt.learning_rate
 
-    # opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)
-    # if not os.path.isdir(opt.tb_folder):
-    #     os.makedirs(opt.tb_folder)
+    opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)
+    if not os.path.isdir(opt.tb_folder):
+        os.makedirs(opt.tb_folder)
 
     opt.save_folder = os.path.join(opt.model_path, opt.model_name)
     if not os.path.isdir(opt.save_folder):
@@ -184,10 +184,11 @@ def set_loader(opt):
 
 def set_model(opt):
     model = SupCEResNet(name=opt.model, num_classes=opt.n_cls)
-    class_weights = 1. / torch.tensor([379, 296, 6366], dtype=torch.float)
-    class_weights = class_weights / class_weights.sum()
+    # class_weights = 1. / torch.tensor([379, 296, 6366], dtype=torch.float)
+    # class_weights = class_weights / class_weights.sum()
 
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+    # criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+    criterion = torch.nn.BinaryCrossEntropyLoss()
 
     # enable synchronized Batch Normalization
     if opt.syncBN:
@@ -311,7 +312,8 @@ def validate(val_loader, model, criterion, opt):
 
 
 def main():
-    wandb.init(project="ce_cimt_all")
+    # wandb.init(project="ce_cimt_all_pretrained")
+    wandb.init(project="bce_sex")
     best_acc = 0
     opt = parse_option()
     
@@ -325,7 +327,7 @@ def main():
     optimizer = set_optimizer(opt, model)
 
     # tensorboard
-    # logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
+    logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
     
     early_stopper = EarlyStopper(patience=10, min_delta=0.01)
     
@@ -340,16 +342,16 @@ def main():
         print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
         # tensorboard logger
-        # logger.log_value('train_loss', loss, epoch)
-        # logger.log_value('train_acc', train_acc, epoch)
-        # logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
+        logger.log_value('train_loss', loss, epoch)
+        logger.log_value('train_acc', train_acc, epoch)
+        logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
         wandb.log({"epoch": epoch, "train_loss": loss, "train_acc": train_acc, "learning_rate": optimizer.param_groups[0]['lr']})
 
         # evaluation
         loss, val_acc = validate(val_loader, model, criterion, opt)
-        # logger.log_value('val_loss', loss, epoch)
-        # logger.log_value('val_acc', val_acc, epoch)
+        logger.log_value('val_loss', loss, epoch)
+        logger.log_value('val_acc', val_acc, epoch)
         wandb.log({"val_loss": loss, "val_acc": val_acc})
         if val_acc > best_acc:
             best_acc = val_acc
@@ -362,8 +364,8 @@ def main():
                 opt.save_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
             save_model(model, optimizer, opt, epoch, save_file)
         
-        # if early_stopper.early_stop(loss):             
-        #     break
+        if early_stopper.early_stop(loss):             
+            break
 
     # save the last model
     save_file = os.path.join(
